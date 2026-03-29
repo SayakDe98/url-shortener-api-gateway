@@ -1,4 +1,3 @@
-```yaml
 name: Deploy API Gateway to ECR
 
 on:
