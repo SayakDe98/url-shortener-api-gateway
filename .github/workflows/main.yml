@@ -4,9 +4,6 @@ on:
   push:
     branches:
       - main
-    paths:
-      - 'api-gateway/**'
-      - '.github/workflows/deploy-api-gateway.yml'
 
 jobs:
   deploy:
