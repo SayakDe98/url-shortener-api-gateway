@@ -1,60 +1,49 @@
-name: Deploy Backend
+name: Deploy API Gateway to ECR
+
 on:
   push:
-    branches: [main]
-env:
-  AWS_REGION: ap-south-1
-  ECR_REPOSITORY: url-shortner
-  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+    branches:
+      - main
+    paths:
+      - 'api-gateway/**'
+      - '.github/workflows/deploy-api-gateway.yml'
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    steps:
-      # 1. Checkout code
-      - name: Checkout
-        uses: actions/checkout@v3
 
-      # 2. Configure AWS
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v3
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
-      # 3. Login to ECR
-      - name: Login to ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: api-gateway
+          IMAGE_TAG: ${{ github.sha }}
         run: |
-          aws ecr get-login-password --region $AWS_REGION | docker login \
-            --username AWS \
-            --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG ./api-gateway
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
-      # 4. Build Docker Image (with cache)
-      - name: Build Docker Image
-        run: |
-          docker pull $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:latest || true
-          docker build \
-            --cache-from $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:latest \
-            -t $ECR_REPOSITORY .
-
-      # 5. Tag Image
-      - name: Tag Docker Image
-        run: |
-          docker tag $ECR_REPOSITORY:latest \
-          $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:latest
-
-      # 6. Push Image
-      - name: Push Docker Image
-        run: |
-          docker push \
-          $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:latest
-
-      # 7. Clean up old/untagged images from ECR
-      - name: Clean Old ECR Images
+      - name: Clean up old ECR images
+        env:
+          ECR_REPOSITORY: api-gateway
         run: |
           IMAGE_IDS=$(aws ecr list-images \
             --repository-name $ECR_REPOSITORY \
-            --region $AWS_REGION \
             --filter tagStatus=UNTAGGED \
             --query 'imageIds[*]' \
             --output json)
@@ -62,69 +51,36 @@ jobs:
           if [ "$IMAGE_IDS" != "[]" ]; then
             aws ecr batch-delete-image \
               --repository-name $ECR_REPOSITORY \
-              --region $AWS_REGION \
               --image-ids "$IMAGE_IDS"
-            echo "Deleted untagged images."
-          else
-            echo "No untagged images to delete."
           fi
 
-      # 8. Deploy to EC2 via SSH
       - name: Deploy to EC2
-        uses: appleboy/ssh-action@v1.0.3
+        uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
+          username: ${{ secrets.EC2_USERNAME }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          envs: AWS_REGION,ECR_REPOSITORY,AWS_ACCOUNT_ID
           script: |
-            set -e
-            IMAGE=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:latest
-            echo "Using image: $IMAGE"
+            ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
+            ECR_REPOSITORY=api-gateway
+            IMAGE_TAG=${{ github.sha }}
 
-            # Login to ECR from EC2
-            aws ecr get-login-password --region $AWS_REGION | docker login \
-              --username AWS \
-              --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | \
+              docker login --username AWS --password-stdin $ECR_REGISTRY
 
-            # Pull latest image
-            docker pull $IMAGE
+            docker pull $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
-            # Create shared Docker network if it doesn't exist
-            docker network create url-shortner-net || true
+            docker stop api-gateway || true
+            docker rm api-gateway || true
 
-            # Start Redis if not already running
-            if [ ! "$(docker ps -q -f name=redis)" ]; then
-              docker run -d \
-                --name redis \
-                --network url-shortner-net \
-                --restart always \
-                -v redis-data:/data \
-                redis:7-alpine redis-server --appendonly yes
-              echo "Redis started."
-            else
-              echo "Redis already running, skipping."
-            fi
+            docker run -d \
+              --name api-gateway \
+              --restart unless-stopped \
+              -p 3000:3000 \
+              -e PORT=${{ secrets.PORT }} \
+              -e GRPC_TARGET=${{ secrets.GRPC_TARGET }} \
+              -e BASE_URL=${{ secrets.BASE_URL }} \
+              -e FRONTEND_URL=${{ secrets.FRONTEND_URL }} \
+              $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
-            # Stop old Go container
-            docker stop url-shortner || true
-            docker rm url-shortner || true
-
-            # Create .env file
-            cat <<EOF > /home/${USER}/.env
-            FRONTEND_URL=${{ secrets.FRONTEND_URL }}
-            DB_URL=${{ secrets.DB_URL }}
-            API_URL=${{ secrets.API_URL }}
-            REDIS_URL=redis://redis:6379
-            APP_ENV=production
-            EOF
-
-            # Run Go container on the same network
-            docker run -d -p 8080:8080 \
-              --name url-shortner \
-              --network url-shortner-net \
-              --restart always \
-              --env-file /home/${USER}/.env \
-              $IMAGE
-
-            echo "Deployment complete."
+            docker image prune -f
