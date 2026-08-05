@@ -9,7 +9,7 @@ RUN corepack enable
 COPY package.json pnpm-lock.yaml ./
 
 # Install only production dependencies
-RUN pnpm install --frozen-lockfile --prod
+RUN pnpm install --frozen-lockfile --prod --config.dangerously-allow-all-builds=true
 
 # Copy source code
 COPY . .
